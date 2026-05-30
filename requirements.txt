@@ -1,0 +1,4 @@
+openai ~= 2.38.0
+google-genai ~= 2.7.0
+z3-solver ~= 4.16.0.0
+ezdxf ~= 1.4.4

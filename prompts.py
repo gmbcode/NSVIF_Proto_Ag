@@ -12,11 +12,14 @@ Link to Seattle Building Code: https://www.seattle.gov/sdci/codes/codes-we-enfor
 STRICT REQUIREMENTS:
 1. You MUST generate a complete, runnable Python script.
 2. The script must save the output file specifically as 'generated_plot.dxf'.
-3. The proposed house outline must be drawn as an LWPOLYLINE and placed strictly on the layer named 'SBC_HOUSE_FOOTPRINT'.
-4. Include these layers if applicable: 'LOT_BOUNDARY', 'BUILDING_SETBACK', 'TREES', 'UTILITIES'.
-5. Maximize the house footprint area while legally staying within the SMC setbacks.
-6. Assume trees are circular
-7. Return ONLY the raw Python code within a Markdown code block (```python ... ```). Do not include any explanations outside the code block.
+3. GEOMETRY LAYERS: You must create and use the following layers: 'LOT_BOUNDARY' (Color 1), 'BUILDING_SETBACK' (Color 3), 'TREES' (Color 3), 'UTILITIES' (Color 5), 'SBC_HOUSE_FOOTPRINT' (Color 6), 'SBC_DOOR' (Color 2), 'SBC_PARKING' (Color 6), and 'ANNOTATIONS' (Color 7). Assume trees are circular.
+4. THE FOOTPRINT CONSTRAINT: The house footprint cannot be an irregular polygon mimicking the curved buffer offsets. It MUST be an orthogonal, rectilinear shape (exactly 4 vertices, 90-degree corners) drawn as an LWPOLYLINE on the 'SBC_HOUSE_FOOTPRINT' layer. It must maximize area while staying safely inside the setbacks.
+5. FIRE SAFETY RULES: You must generate two additional elements:
+   - Draw a 10ft wide line representing the Main Door on the 'SBC_DOOR' layer. This line must lie exactly on one of the outer walls of the house footprint.
+   - Draw a 10ft x 20ft rectangle representing a Parking Spot on the 'SBC_PARKING' layer. 
+   - CRUCIAL: The Main Door and the Parking Spot MUST be located on the SAME side of the house.
+6. ANNOTATIONS: You must use `msp.add_text()` to place descriptive labels on the 'ANNOTATIONS' layer. Include a large title "SEATTLE BUILDING CODE TEST LOT" at the top left, label the calculated Area of the House Footprint near the center of the house, and label the Tree and Utility Easement.
+7. OUTPUT FORMAT: Return ONLY the raw Python code within a Markdown code block (```python ... ```). Do not include any explanations, greetings, or text outside the code block.
 """
 
 GEMINI_INITIAL_PROMPT = """

@@ -1,168 +1,214 @@
 import ezdxf
 import json
-import math
 from z3 import *
+from shapely.geometry import Polygon, box, Point
 
 
 def extract_house_bounds(dxf_path, layer_name="SBC_HOUSE_FOOTPRINT"):
     """
-    Extracts the axis-aligned bounding box (xmin, xmax, ymin, ymax)
-    of the proposed house footprint from the specified DXF layer.
+    Extracts the bounding box, but FIRST enforces architectural topology:
+    The footprint must be a strictly 4-sided orthogonal rectangle.
     """
     try:
         doc = ezdxf.readfile(dxf_path)
     except IOError:
-        return None, f"Error: Cannot read or find DXF file at {dxf_path}"
+        return None, f"Error: Cannot read DXF file at {dxf_path}"
 
     msp = doc.modelspace()
     polylines = msp.query(f'LWPOLYLINE[layer=="{layer_name}"]')
 
     if not polylines:
-        # Fallback to checking normal lines if no polyline is found
-        lines = msp.query(f'LINE[layer=="{layer_name}"]')
-        if not lines:
-            return None, f"Error: No geometries found on layer '{layer_name}'"
+        return None, f"Error: No geometries found on layer '{layer_name}'"
 
-        x_coords = [l.dxf.start.x for l in lines] + [l.dxf.end.x for l in lines]
-        y_coords = [l.dxf.start.y for l in lines] + [l.dxf.end.y for l in lines]
-    else:
-        # Extract from the first found polyline footprint
-        polyline = polylines[0]
-        points = list(polyline.get_points('xy'))
-        x_coords = [p[0] for p in points]
-        y_coords = [p[1] for p in points]
+    polyline = polylines[0]
+    points = list(polyline.get_points('xy'))
+
+    # Remove the last point if ezdxf duplicated it to close the loop
+    if len(points) > 1 and points[0] == points[-1]:
+        points = points[:-1]
+
+    # TOPOLOGY CHECK 1: Must be exactly 4 vertices
+    if len(points) != 4:
+        return None, f"ARCHITECTURAL VIOLATION: House footprint has {len(points)} vertices. It must be a simple 4-sided rectangle, not a complex polygon."
+
+    # TOPOLOGY CHECK 2: Edges must be orthogonal (90 degrees / axis-aligned)
+    for i in range(4):
+        p1 = points[i]
+        p2 = points[(i + 1) % 4]
+        is_horizontal = abs(p1[1] - p2[1]) < 1e-5
+        is_vertical = abs(p1[0] - p2[0]) < 1e-5
+
+        if not (is_horizontal or is_vertical):
+            return None, "ARCHITECTURAL VIOLATION: House footprint contains diagonal lines. All walls must be strictly horizontal or vertical."
+
+    x_coords = [p[0] for p in points]
+    y_coords = [p[1] for p in points]
 
     return (min(x_coords), max(x_coords), min(y_coords), max(y_coords)), None
 
 
+def get_heuristic_max_rectangle(poly, p_box):
+    """
+    Dynamically finds a local maximum valid footprint by incrementally
+    expanding the proposed valid box until it hits the setback boundaries.
+    """
+    if poly.contains(p_box):
+        cx, cy, cx2, cy2 = p_box.bounds
+    else:
+        # Fallback to a tiny box at the centroid if current design is invalid
+        rp = poly.representative_point()
+        cx, cy, cx2, cy2 = rp.x - 0.5, rp.y - 0.5, rp.x + 0.5, rp.y + 0.5
+        if not poly.contains(box(cx, cy, cx2, cy2)):
+            return poly.bounds  # Absolute worst-case fallback
+
+    step = 2.0
+    while step >= 0.1:
+        expanded_this_step = False
+
+        # Expand Right
+        if poly.contains(box(cx, cy, cx2 + step, cy2)):
+            cx2 += step
+            expanded_this_step = True
+        # Expand Left
+        if poly.contains(box(cx - step, cy, cx2, cy2)):
+            cx -= step
+            expanded_this_step = True
+        # Expand Top
+        if poly.contains(box(cx, cy, cx2, cy2 + step)):
+            cy2 += step
+            expanded_this_step = True
+        # Expand Bottom
+        if poly.contains(box(cx, cy - step, cx2, cy2)):
+            cy -= step
+            expanded_this_step = True
+
+        # Halve the step size for tighter precision if we get stuck
+        if not expanded_this_step:
+            step /= 2.0
+
+    return cx, cy, cx2, cy2
+
+
 def verify_and_optimize_footprint(dxf_path):
-    # 1. Extract Proposed Coordinates
+    # 1. Extract Proposed Coordinates & Enforce Topology
     bounds, error = extract_house_bounds(dxf_path)
     if error:
+        # Instantly fail if Agent 1 tried to draw an irregular blob
         return json.dumps({"status": "ERROR", "message": error}, indent=2)
 
     p_xmin, p_xmax, p_ymin, p_ymax = bounds
-    p_width = p_xmax - p_xmin
-    p_height = p_ymax - p_ymin
-    p_area = p_width * p_height
+    p_area = (p_xmax - p_xmin) * (p_ymax - p_ymin)
+    proposed_box = box(p_xmin, p_ymin, p_xmax, p_ymax)
 
-    # Initialize Z3 Solver for Verification
+    # 2. Extract DYNAMIC Constraints from the DXF
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
+
+    setback_polys = msp.query('LWPOLYLINE[layer=="BUILDING_SETBACK"]')
+    if not setback_polys:
+        return json.dumps({"status": "ERROR", "message": "Missing BUILDING_SETBACK layer in DXF."}, indent=2)
+
+    sb_points = list(setback_polys[0].get_points('xy'))
+    setback_polygon = Polygon(sb_points)
+    b_minx, b_miny, b_maxx, b_maxy = setback_polygon.bounds
+
+    # 3. Initialize Z3 Solver for Verification
     v_solver = Solver()
-
-    # Symbolic variables for verification
     xmin, xmax, ymin, ymax = Reals('xmin xmax ymin ymax')
 
-    # Bind symbolic variables to the actual proposed values from DXF
+    # Bind symbolic variables
     v_solver.add(xmin == p_xmin)
     v_solver.add(xmax == p_xmax)
     v_solver.add(ymin == p_ymin)
     v_solver.add(ymax == p_ymax)
 
     # -------------------------------------------------------------------------
-    # SEATTLE BUILDING / MUNICIPAL CODE CONSTRAINTS (LR ZONE SETBACKS)
+    # DYNAMIC SEATTLE BUILDING CODE CONSTRAINTS
     # -------------------------------------------------------------------------
-    # Rule 1: West Side Setback (Property line x = 0 -> min x = 5)
-    c_west = xmin >= 5
 
-    # Rule 2: East Side Setback (Property line x = 80 -> max x = 75)
-    c_east = xmax <= 75
+    # Base Box Constraints (Dynamic from the global limits of the setback layer)
+    c_west = xmin >= b_minx
+    c_east = xmax <= b_maxx
+    c_south = ymin >= b_miny
+    c_north = ymax <= b_maxy
 
-    # Rule 3: North Rear Setback (Property line y = 84 for x <= 75 -> max y = 77)
-    c_north = ymax <= 77
-
-    # Rule 4: South Front Setback (Property line y = 8 for x < 35 -> min y = 15)
-    c_south_west = Implies(xmin < 35, ymin >= 15)
-
-    # Rule 5: South Front Setback Notch (Property line y = 0 for 35 <= x <= 75 -> min y = 7)
-    c_south_notch = ymin >= 7
-
-    # Rule 6: Inner Notch Corner Side Setback (Property line x = 35 for y <= 8 -> 5ft side setback)
-    c_inner_notch = Implies(ymin < 8, xmin >= 40)
-
-    # Rule 7: Protected Tree Keep-out Circle (Center: 77.5, 86 | Radius: sqrt(3))
-    # Check distance from the closest house corner (xmax, ymax) to tree center
-    tree_dist_sq = (77.5 - xmax) ** 2 + (86 - ymax) ** 2
-    c_tree = tree_dist_sq > 3.0
-
-    # 2. RUN VERIFICATION PHASE
-    violations = []
+    # Complex Geometry Constraint (Bridging Shapely intersection logic into Z3 Booleans)
+    is_inside_complex = setback_polygon.contains(proposed_box)
+    c_complex = BoolVal(is_inside_complex)
 
     rules = [
-        (c_west, "SMC 23.45.518: West side setback violation. Must be x >= 5."),
-        (c_east, "SMC 23.45.518: East side setback violation. Must be x <= 75."),
-        (c_north, "SMC 23.45.518: Rear north setback violation. Must be y <= 77."),
-        (c_south_west, "SMC 23.45.518: Front south setback violation on the western wing. Must be y >= 15 if x < 35."),
-        (c_south_notch, "SMC 23.45.518: Front south setback violation in the notch area. Must be y >= 7."),
-        (c_inner_notch,
-         "SMC 23.45.518: Inner corner horizontal setback violation. Must be x >= 40 if footprint drops below y = 8."),
-        (c_tree,
-         "SBC / DR 16-2008: Protected tree root zone invasion. The footprint is too close to the tree at (77.5, 86).")
+        (c_west, f"SMC Constraint: Global West boundary violation. Must be x >= {b_minx:.2f}."),
+        (c_east, f"SMC Constraint: Global East boundary violation. Must be x <= {b_maxx:.2f}."),
+        (c_south, f"SMC Constraint: Global South boundary violation. Must be y >= {b_miny:.2f}."),
+        (c_north, f"SMC Constraint: Global North boundary violation. Must be y <= {b_maxy:.2f}."),
+        (c_complex, "SMC Constraint: Footprint violates an irregular interior setback boundary (diagonals or notches).")
     ]
 
+    # Dynamic Tree Constraints
+    trees = msp.query('CIRCLE[layer=="TREES"]')
+    for idx, t in enumerate(trees):
+        tx, ty = t.dxf.center.x, t.dxf.center.y
+        tr = t.dxf.radius
+        # Check if the proposed house hits the tree buffer
+        tree_circle = Point(tx, ty).buffer(tr)
+        is_safe_from_tree = not proposed_box.intersects(tree_circle)
+        rules.append((BoolVal(is_safe_from_tree),
+                      f"SBC / DR 16-2008: Protected tree root zone invasion at ({tx:.1f}, {ty:.1f})."))
+
+    # RUN VERIFICATION PHASE
+    violations = []
     for condition, message in rules:
         v_solver.push()
-        v_solver.add(Not(condition))  # Assert the negation to find if a violation is possible
+        v_solver.add(Not(condition))  # Assert the negation
         if v_solver.check() == sat:
             violations.append(message)
         v_solver.pop()
 
     # -------------------------------------------------------------------------
-    # 3. RUN OPTIMIZATION PHASE (Finding the Maximum Legal Envelope)
+    # DYNAMIC OPTIMIZATION PHASE (Finding the Maximum Legal Envelope)
     # -------------------------------------------------------------------------
-    # We solve the two primary geometric configurations for a single rectangle layout
-    # Option A: Wide layout spanning into the western block (x < 35)
-    # Option B: Narrow layout contained completely within the southern notch (x >= 40)
 
-    opt_solver = Optimize()
-    o_xmin, o_xmax, o_ymin, o_ymax = Reals('o_xmin o_xmax o_ymin o_ymax')
+    opt_xmin, opt_ymin, opt_xmax, opt_ymax = get_heuristic_max_rectangle(setback_polygon, proposed_box)
+    max_legal_area = round((opt_xmax - opt_xmin) * (opt_ymax - opt_ymin), 2)
 
-    # Global architectural rules
-    opt_solver.add(o_xmin >= 5)
-    opt_solver.add(o_xmax <= 75)
-    opt_solver.add(o_ymax <= 77)
-    opt_solver.add(o_ymin >= 7)
-    opt_solver.add(Implies(o_xmin < 35, o_ymin >= 15))
-    opt_solver.add(Implies(o_ymin < 8, o_xmin >= 40))
-    opt_solver.add(((77.5 - o_xmax) ** 2 + (86 - o_ymax) ** 2) > 3.0)
-
-    # Objective: Maximize Area
-    area_expr = (o_xmax - o_xmin) * (o_ymax - o_ymin)
-
-    # Since Z3 handles non-linear maximization via specific handles, we evaluate
-    # the maximum bounds programmatically to ensure deterministic behavior for the agent.
-    max_legal_area = 4340.0  # Wide configuration: (75-5) * (77-15) = 70 * 62
-    optimal_bounds = {"xmin": 5.0, "xmax": 75.0, "ymin": 15.0, "ymax": 77.0}
+    optimal_bounds = {
+        "xmin": round(opt_xmin, 2),
+        "xmax": round(opt_xmax, 2),
+        "ymin": round(opt_ymin, 2),
+        "ymax": round(opt_ymax, 2)
+    }
 
     is_optimized = True
     optimization_suggestions = []
 
     if len(violations) == 0:
-        # Check if the user's design matches or is close to the absolute maximum footprint area
         area_efficiency = (p_area / max_legal_area) * 100
-        if area_efficiency < 99.5:
+        if area_efficiency < 99.0:
             is_optimized = False
             optimization_suggestions.append(
-                f"The current design covers {p_area:.1f} sq ft, which is only {area_efficiency:.1f}% of the maximum allowable space."
+                f"The current valid design covers {p_area:.1f} sq ft, which is only {area_efficiency:.1f}% of the allowable space."
             )
             optimization_suggestions.append(
-                f"To maximize footprint, expand your single rectangle dimensions to the absolute legal limits: "
+                f"To maximize footprint, expand your dimensions to target these limits: "
                 f"x ranges from {optimal_bounds['xmin']} to {optimal_bounds['xmax']} feet, "
-                f"y ranges from {optimal_bounds['ymin']} to {optimal_bounds['ymax']} feet to achieve {max_legal_area} sq ft."
+                f"y ranges from {optimal_bounds['ymin']} to {optimal_bounds['ymax']} feet to achieve ~{max_legal_area} sq ft."
             )
     else:
         is_optimized = False
         optimization_suggestions.append(
-            "Cannot calculate expansion optimizations until the existing layout violations are resolved.")
+            "Cannot calculate expansion optimizations until the existing geometric violations are resolved."
+        )
 
     # 4. CONSTRUCT STRUCTURED JSON RESPONSE FOR THE NEXT AGENT
     output_report = {
-        "status": "REJECTED" if violations else "APPROVED",
+        # This will now correctly reject valid but un-optimized designs
+        "status": "APPROVED" if (not violations and is_optimized) else "REJECTED",
         "proposed_footprint": {
-            "xmin": p_xmin,
-            "xmax": p_xmax,
-            "ymin": p_ymin,
-            "ymax": p_ymax,
-            "calculated_area_sqft": p_area
+            "xmin": round(p_xmin, 2),
+            "xmax": round(p_xmax, 2),
+            "ymin": round(p_ymin, 2),
+            "ymax": round(p_ymax, 2),
+            "calculated_area_sqft": round(p_area, 2)
         },
         "violations_found": violations,
         "optimization": {
@@ -175,6 +221,5 @@ def verify_and_optimize_footprint(dxf_path):
 
     return json.dumps(output_report, indent=2)
 
-
 # Execution placeholder for your pipeline:
-print(verify_and_optimize_footprint("seattle_lot_plan_v2.dxf"))
+# print(verify_and_optimize_footprint("generated_plot.dxf"))

@@ -83,7 +83,7 @@ def run_agent_loop(image_path: str, max_iterations: int = 5):
             contents.extend(msg["parts"])
 
         gemini_response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.5-flash',
             contents=contents
         )
 
@@ -143,4 +143,4 @@ def run_agent_loop(image_path: str, max_iterations: int = 5):
 
 
 if __name__ == "__main__":
-    run_agent_loop("image_21bab4.png")
+    run_agent_loop("test_02.jpg")

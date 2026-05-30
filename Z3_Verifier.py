@@ -175,5 +175,6 @@ def verify_and_optimize_footprint(dxf_path):
 
     return json.dumps(output_report, indent=2)
 
+
 # Execution placeholder for your pipeline:
 print(verify_and_optimize_footprint("seattle_lot_plan_v2.dxf"))

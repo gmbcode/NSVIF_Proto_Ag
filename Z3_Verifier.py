@@ -1,225 +1,210 @@
 import ezdxf
-import json
-from z3 import *
 from shapely.geometry import Polygon, box, Point
+from shapely.ops import unary_union
+from z3 import *
+import json
+import math
+
+# The required rooms for the interior program (Corridor added per new constraints)
+REQUIRED_ROOMS = ["Living", "Kitchen", "Bedroom", "Bathroom", "Corridor"]
 
 
-def extract_house_bounds(dxf_path, layer_name="SBC_HOUSE_FOOTPRINT"):
+def extract_dynamic_environment(dxf_path):
     """
-    Extracts the bounding box, but FIRST enforces architectural topology:
-    The footprint must be a strictly 4-sided orthogonal rectangle.
+    Dynamically extracts the Plot Boundary, Setbacks, and Protected Trees
+    directly from the CAD file layers so the solver is strictly universal.
     """
     try:
         doc = ezdxf.readfile(dxf_path)
-    except IOError:
-        return None, f"Error: Cannot read DXF file at {dxf_path}"
+        msp = doc.modelspace()
+    except Exception as e:
+        return None, None, [], f"FILE ERROR: Could not read DXF. {str(e)}"
 
-    msp = doc.modelspace()
-    polylines = msp.query(f'LWPOLYLINE[layer=="{layer_name}"]')
+    # 1. Extract Plot Boundary
+    lot_polys = msp.query('LWPOLYLINE[layer=="LOT_BOUNDARY"]')
+    if not lot_polys:
+        return None, None, [], "ENVIRONMENT VIOLATION: Missing 'LOT_BOUNDARY' polyline. Cannot calculate setbacks."
 
-    if not polylines:
-        return None, f"Error: No geometries found on layer '{layer_name}'"
+    lot_points = list(lot_polys[0].get_points('xy'))
+    plot_polygon = Polygon(lot_points)
 
-    polyline = polylines[0]
-    points = list(polyline.get_points('xy'))
+    # Calculate Buildable Envelope (Seattle LR zone: 5ft side, 7ft front/rear)
+    # Using a generalized -5.0 ft buffer for this universal heuristic script.
+    buildable_polygon = plot_polygon.buffer(-5.0)
 
-    # Remove the last point if ezdxf duplicated it to close the loop
-    if len(points) > 1 and points[0] == points[-1]:
-        points = points[:-1]
-
-    # TOPOLOGY CHECK 1: Must be exactly 4 vertices
-    if len(points) != 4:
-        return None, f"ARCHITECTURAL VIOLATION: House footprint has {len(points)} vertices. It must be a simple 4-sided rectangle, not a complex polygon."
-
-    # TOPOLOGY CHECK 2: Edges must be orthogonal (90 degrees / axis-aligned)
-    for i in range(4):
-        p1 = points[i]
-        p2 = points[(i + 1) % 4]
-        is_horizontal = abs(p1[1] - p2[1]) < 1e-5
-        is_vertical = abs(p1[0] - p2[0]) < 1e-5
-
-        if not (is_horizontal or is_vertical):
-            return None, "ARCHITECTURAL VIOLATION: House footprint contains diagonal lines. All walls must be strictly horizontal or vertical."
-
-    x_coords = [p[0] for p in points]
-    y_coords = [p[1] for p in points]
-
-    return (min(x_coords), max(x_coords), min(y_coords), max(y_coords)), None
-
-
-def get_heuristic_max_rectangle(poly, p_box):
-    """
-    Dynamically finds a local maximum valid footprint by incrementally
-    expanding the proposed valid box until it hits the setback boundaries.
-    """
-    if poly.contains(p_box):
-        cx, cy, cx2, cy2 = p_box.bounds
-    else:
-        # Fallback to a tiny box at the centroid if current design is invalid
-        rp = poly.representative_point()
-        cx, cy, cx2, cy2 = rp.x - 0.5, rp.y - 0.5, rp.x + 0.5, rp.y + 0.5
-        if not poly.contains(box(cx, cy, cx2, cy2)):
-            return poly.bounds  # Absolute worst-case fallback
-
-    step = 2.0
-    while step >= 0.1:
-        expanded_this_step = False
-
-        # Expand Right
-        if poly.contains(box(cx, cy, cx2 + step, cy2)):
-            cx2 += step
-            expanded_this_step = True
-        # Expand Left
-        if poly.contains(box(cx - step, cy, cx2, cy2)):
-            cx -= step
-            expanded_this_step = True
-        # Expand Top
-        if poly.contains(box(cx, cy, cx2, cy2 + step)):
-            cy2 += step
-            expanded_this_step = True
-        # Expand Bottom
-        if poly.contains(box(cx, cy - step, cx2, cy2)):
-            cy -= step
-            expanded_this_step = True
-
-        # Halve the step size for tighter precision if we get stuck
-        if not expanded_this_step:
-            step /= 2.0
-
-    return cx, cy, cx2, cy2
-
-
-def verify_and_optimize_footprint(dxf_path):
-    # 1. Extract Proposed Coordinates & Enforce Topology
-    bounds, error = extract_house_bounds(dxf_path)
-    if error:
-        # Instantly fail if Agent 1 tried to draw an irregular blob
-        return json.dumps({"status": "ERROR", "message": error}, indent=2)
-
-    p_xmin, p_xmax, p_ymin, p_ymax = bounds
-    p_area = (p_xmax - p_xmin) * (p_ymax - p_ymin)
-    proposed_box = box(p_xmin, p_ymin, p_xmax, p_ymax)
-
-    # 2. Extract DYNAMIC Constraints from the DXF
-    doc = ezdxf.readfile(dxf_path)
-    msp = doc.modelspace()
-
-    setback_polys = msp.query('LWPOLYLINE[layer=="BUILDING_SETBACK"]')
-    if not setback_polys:
-        return json.dumps({"status": "ERROR", "message": "Missing BUILDING_SETBACK layer in DXF."}, indent=2)
-
-    sb_points = list(setback_polys[0].get_points('xy'))
-    setback_polygon = Polygon(sb_points)
-    b_minx, b_miny, b_maxx, b_maxy = setback_polygon.bounds
-
-    # 3. Initialize Z3 Solver for Verification
-    v_solver = Solver()
-    xmin, xmax, ymin, ymax = Reals('xmin xmax ymin ymax')
-
-    # Bind symbolic variables
-    v_solver.add(xmin == p_xmin)
-    v_solver.add(xmax == p_xmax)
-    v_solver.add(ymin == p_ymin)
-    v_solver.add(ymax == p_ymax)
-
-    # -------------------------------------------------------------------------
-    # DYNAMIC SEATTLE BUILDING CODE CONSTRAINTS
-    # -------------------------------------------------------------------------
-
-    # Base Box Constraints (Dynamic from the global limits of the setback layer)
-    c_west = xmin >= b_minx
-    c_east = xmax <= b_maxx
-    c_south = ymin >= b_miny
-    c_north = ymax <= b_maxy
-
-    # Complex Geometry Constraint (Bridging Shapely intersection logic into Z3 Booleans)
-    is_inside_complex = setback_polygon.contains(proposed_box)
-    c_complex = BoolVal(is_inside_complex)
-
-    rules = [
-        (c_west, f"SMC Constraint: Global West boundary violation. Must be x >= {b_minx:.2f}."),
-        (c_east, f"SMC Constraint: Global East boundary violation. Must be x <= {b_maxx:.2f}."),
-        (c_south, f"SMC Constraint: Global South boundary violation. Must be y >= {b_miny:.2f}."),
-        (c_north, f"SMC Constraint: Global North boundary violation. Must be y <= {b_maxy:.2f}."),
-        (c_complex, "SMC Constraint: Footprint violates an irregular interior setback boundary (diagonals or notches).")
-    ]
-
-    # Dynamic Tree Constraints
+    # 2. Extract Trees Dynamically
+    tree_zones = []
     trees = msp.query('CIRCLE[layer=="TREES"]')
-    for idx, t in enumerate(trees):
+    for t in trees:
         tx, ty = t.dxf.center.x, t.dxf.center.y
         tr = t.dxf.radius
-        # Check if the proposed house hits the tree buffer
-        tree_circle = Point(tx, ty).buffer(tr)
-        is_safe_from_tree = not proposed_box.intersects(tree_circle)
-        rules.append((BoolVal(is_safe_from_tree),
-                      f"SBC / DR 16-2008: Protected tree root zone invasion at ({tx:.1f}, {ty:.1f})."))
+        tree_zones.append(Point(tx, ty).buffer(tr))
 
-    # RUN VERIFICATION PHASE
+    return plot_polygon, buildable_polygon, tree_zones, None
+
+
+def extract_rooms(dxf_path):
+    """Extracts all rectangular rooms from the DXF and enforces orthogonal topology."""
+    try:
+        doc = ezdxf.readfile(dxf_path)
+        msp = doc.modelspace()
+    except Exception:
+        return None, None, "FILE ERROR: Could not read DXF."
+
+    room_polys = msp.query('LWPOLYLINE[layer=="ROOMS"]')
+    texts = list(msp.query('TEXT[layer=="ANNOTATIONS"]'))
+
+    rooms_data = {}
+    room_shapes = []
+
+    for i, poly in enumerate(room_polys):
+        points = list(poly.get_points('xy'))
+        if len(points) > 1 and points[0] == points[-1]:
+            points = points[:-1]
+
+        # TOPOLOGY CHECK: Must be exactly 4 vertices
+        if len(points) != 4:
+            return None, None, f"TOPOLOGY VIOLATION: A room has {len(points)} vertices instead of 4."
+
+        # TOPOLOGY CHECK: Must be strictly orthogonal
+        for j in range(4):
+            p1 = points[j]
+            p2 = points[(j + 1) % 4]
+            if not (abs(p1[1] - p2[1]) < 1e-5 or abs(p1[0] - p2[0]) < 1e-5):
+                return None, None, "TOPOLOGY VIOLATION: All rooms must be perfectly orthogonal rectangles."
+
+        x_coords = [p[0] for p in points]
+        y_coords = [p[1] for p in points]
+        xmin, xmax, ymin, ymax = min(x_coords), max(x_coords), min(y_coords), max(y_coords)
+
+        # Match label to room (check if text is inside the bounds)
+        room_name = f"Unknown_Room_{i}"
+        for t in texts:
+            tx, ty = t.dxf.insert.x, t.dxf.insert.y
+            if xmin <= tx <= xmax and ymin <= ty <= ymax:
+                room_name = t.dxf.text.strip()
+                break
+
+        rooms_data[room_name] = {"xmin": xmin, "xmax": xmax, "ymin": ymin, "ymax": ymax}
+        room_shapes.append(box(xmin, ymin, xmax, ymax))
+
+    return rooms_data, room_shapes, None
+
+
+def verify_layout(dxf_path):
+    # 1. Dynamically load the plot and trees
+    plot_poly, buildable_poly, tree_zones, env_error = extract_dynamic_environment(dxf_path)
+    if env_error:
+        return json.dumps({"status": "REJECTED", "violations": [env_error]}, indent=2)
+
+    # 2. Extract the generated rooms
+    rooms_data, room_shapes, error = extract_rooms(dxf_path)
+    if error:
+        return json.dumps({"status": "REJECTED", "violations": [error]}, indent=2)
+
     violations = []
-    for condition, message in rules:
+    v_solver = Solver()
+
+    # --- A. CHECK MISSING ROOMS ---
+    found_rooms = list(rooms_data.keys())
+    for req in REQUIRED_ROOMS:
+        if not any(req in r for r in found_rooms):
+            violations.append(f"PROGRAMMING VIOLATION: Missing required room '{req}'.")
+
+    # --- B. Z3 LOGICAL CONSTRAINTS (TILING & INTERIOR) ---
+        # --- B. Z3 LOGICAL CONSTRAINTS (TILING & INTERIOR) ---
+    z3_rooms = {}
+    for name, b in rooms_data.items():
+        # FIX: Replace spaces with underscores so Z3 doesn't split the names
+        safe_name = name.replace(" ", "_")
+
+        xmin, xmax, ymin, ymax = Reals(f'{safe_name}_xmin {safe_name}_xmax {safe_name}_ymin {safe_name}_ymax')
+        v_solver.add(xmin == b['xmin'], xmax == b['xmax'])
+        v_solver.add(ymin == b['ymin'], ymax == b['ymax'])
+
+        # Keep the original name for the dictionary key so the rest of the logic works
+        z3_rooms[name] = (xmin, xmax, ymin, ymax)
+
+    # 1. Exact Tiling (No Overlaps except Bathrooms)
+    for i in range(len(found_rooms)):
+        for j in range(i + 1, len(found_rooms)):
+            n1, n2 = found_rooms[i], found_rooms[j]
+            x1_min, x1_max, y1_min, y1_max = z3_rooms[n1]
+            x2_min, x2_max, y2_min, y2_max = z3_rooms[n2]
+
+            # Bathroom is allowed to be INSIDE the Bedroom
+            if ("Bathroom" in n1 and "Bedroom" in n2) or ("Bathroom" in n2 and "Bedroom" in n1):
+                continue
+
+            no_overlap = Or(x1_max <= x2_min, x2_max <= x1_min, y1_max <= y2_min, y2_max <= y1_min)
+            v_solver.push()
+            v_solver.add(Not(no_overlap))
+            if v_solver.check() == sat:
+                violations.append(
+                    f"TILING VIOLATION: '{n1}' and '{n2}' are overlapping. Rooms must sit flush against each other.")
+            v_solver.pop()
+
+    # 2. Bathroom Inside Bedroom Logic
+    bed_keys = [k for k in found_rooms if "Bedroom" in k]
+    bath_keys = [k for k in found_rooms if "Bathroom" in k]
+    if bed_keys and bath_keys:
+        bed, bath = z3_rooms[bed_keys[0]], z3_rooms[bath_keys[0]]
+        is_inside = And(bath[0] >= bed[0], bath[1] <= bed[1], bath[2] >= bed[2], bath[3] <= bed[3])
         v_solver.push()
-        v_solver.add(Not(condition))  # Assert the negation
+        v_solver.add(Not(is_inside))
         if v_solver.check() == sat:
-            violations.append(message)
+            violations.append(
+                "LAYOUT VIOLATION: The Bathroom must be fully contained within the bounds of the Bedroom.")
         v_solver.pop()
 
-    # -------------------------------------------------------------------------
-    # DYNAMIC OPTIMIZATION PHASE (Finding the Maximum Legal Envelope)
-    # -------------------------------------------------------------------------
-
-    opt_xmin, opt_ymin, opt_xmax, opt_ymax = get_heuristic_max_rectangle(setback_polygon, proposed_box)
-    max_legal_area = round((opt_xmax - opt_xmin) * (opt_ymax - opt_ymin), 2)
-
-    optimal_bounds = {
-        "xmin": round(opt_xmin, 2),
-        "xmax": round(opt_xmax, 2),
-        "ymin": round(opt_ymin, 2),
-        "ymax": round(opt_ymax, 2)
-    }
-
-    is_optimized = True
-    optimization_suggestions = []
-
-    if len(violations) == 0:
-        area_efficiency = (p_area / max_legal_area) * 100
-        if area_efficiency < 99.0:
-            is_optimized = False
-            optimization_suggestions.append(
-                f"The current valid design covers {p_area:.1f} sq ft, which is only {area_efficiency:.1f}% of the allowable space."
-            )
-            optimization_suggestions.append(
-                f"To maximize footprint, expand your dimensions to target these limits: "
-                f"x ranges from {optimal_bounds['xmin']} to {optimal_bounds['xmax']} feet, "
-                f"y ranges from {optimal_bounds['ymin']} to {optimal_bounds['ymax']} feet to achieve ~{max_legal_area} sq ft."
-            )
+    # 3. Door & Fire Safety Logic
+    doc = ezdxf.readfile(dxf_path)
+    door_lines = doc.modelspace().query('LINE[layer=="SBC_DOOR"]')
+    if not door_lines:
+        violations.append("FIRE CODE VIOLATION: Missing Main Door line on 'SBC_DOOR' layer.")
     else:
-        is_optimized = False
-        optimization_suggestions.append(
-            "Cannot calculate expansion optimizations until the existing geometric violations are resolved."
-        )
+        door = door_lines[0]
+        dx, dy = door.dxf.start.x, door.dxf.start.y
 
-    # 4. CONSTRUCT STRUCTURED JSON RESPONSE FOR THE NEXT AGENT
-    output_report = {
-        # This will now correctly reject valid but un-optimized designs
-        "status": "APPROVED" if (not violations and is_optimized) else "REJECTED",
-        "proposed_footprint": {
-            "xmin": round(p_xmin, 2),
-            "xmax": round(p_xmax, 2),
-            "ymin": round(p_ymin, 2),
-            "ymax": round(p_ymax, 2),
-            "calculated_area_sqft": round(p_area, 2)
-        },
-        "violations_found": violations,
-        "optimization": {
-            "is_maximally_optimized": is_optimized,
-            "theoretical_max_area_sqft": max_legal_area,
-            "target_optimal_bounds": optimal_bounds,
-            "suggestions": optimization_suggestions
-        }
-    }
+        # Door must touch Living Room
+        living_keys = [k for k in found_rooms if "Living" in k]
+        if living_keys:
+            lx_min, lx_max, ly_min, ly_max = z3_rooms[living_keys[0]]
+            door_on_living = Or(
+                And(dx == lx_min, dy >= ly_min, dy <= ly_max),  # Touching Left wall
+                And(dx == lx_max, dy >= ly_min, dy <= ly_max),  # Touching Right wall
+                And(dy == ly_min, dx >= lx_min, dx <= lx_max),  # Touching Bottom wall
+                And(dy == ly_max, dx >= lx_min, dx <= lx_max)  # Touching Top wall
+            )
+            v_solver.push()
+            v_solver.add(Not(door_on_living))
+            if v_solver.check() == sat:
+                violations.append("FIRE CODE VIOLATION: Main entry door does not touch the Living Room.")
+            v_solver.pop()
 
-    return json.dumps(output_report, indent=2)
+    # --- C. SHAPELY EXTERNAL CONSTRAINTS (Setbacks & Trees) ---
+    if room_shapes:
+        composite_footprint = unary_union(room_shapes)
 
-# Execution placeholder for your pipeline:
-# print(verify_and_optimize_footprint("generated_plot.dxf"))
+        # Floating point tolerance (+0.1 buffer) so perfectly aligned walls don't trigger a false UNSAT
+        buffered_buildable = buildable_poly.buffer(0.1)
+
+        # Setback Check
+        if not buffered_buildable.contains(composite_footprint):
+            violations.append("SETBACK VIOLATION: The composite footprint crosses the allowed green setback lines.")
+
+        # Tree CRZ Check (Negative buffer shrinks the footprint slightly to avoid false touches)
+        for i, tree_crz in enumerate(tree_zones):
+            if composite_footprint.buffer(-0.1).intersects(tree_crz):
+                violations.append(
+                    f"ENVIRONMENTAL VIOLATION: A room breaches Protected Tree #{i + 1} Critical Root Zone.")
+
+    return json.dumps({
+        "status": "REJECTED" if violations else "APPROVED",
+        "violations": violations,
+        "rooms": rooms_data
+    }, indent=2)
+
+
+if __name__ == "__main__":
+    print(verify_layout("generated_plot.dxf"))

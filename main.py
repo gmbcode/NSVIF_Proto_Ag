@@ -12,12 +12,12 @@ from openai import OpenAI
 
 # Local imports
 import prompts
-from Z3_Verifier import verify_and_optimize_footprint
+from Z3_Verifier import verify_layout
 
 # Load Environment Variables
 config = dotenv_values(".env")
 gemini_api_key = config.get('GEMINI_API_KEY')
-deepseek_api_key = config.get('DEEPSEEK_API_KEY')
+deepseek_api_key = config.get('DEEPSEEK_API_KEY') # We are using NVIDIA NIM for our case but any OPENAI compatible key will work
 
 # Initialize Clients
 gemini_client = genai.Client(api_key=gemini_api_key)
@@ -41,7 +41,7 @@ def summarize_violations(z3_json_report: str) -> str:
     """Agent 2 (DeepSeek via NVIDIA) interprets the Z3 JSON and creates a feedback prompt."""
     print("\n[Agent 2 - DeepSeek] Analyzing Z3 Verifier report...")
     response = deepseek_client.chat.completions.create(
-        model="deepseek-ai/deepseek-v4-pro",
+        model="deepseek-ai/deepseek-v4-flash",
         messages=[
             {"role": "system", "content": prompts.DEEPSEEK_SYSTEM_PROMPT},
             {"role": "user", "content": z3_json_report}
@@ -95,7 +95,7 @@ def run_agent_loop(image_path: str, max_iterations: int = 5):
         script_filename = "temp_generated_dxf_script.py"
         output_dxf = "generated_plot.dxf"
 
-        with open(script_filename, "w") as f:
+        with open(script_filename, "w",encoding="utf-8") as f:
             f.write(script_code)
 
         print("[System] Executing generated Python script...")
@@ -114,7 +114,7 @@ def run_agent_loop(image_path: str, max_iterations: int = 5):
             continue
 
         print("[Z3 Solver] Evaluating constraints...")
-        z3_json_str = verify_and_optimize_footprint(output_dxf)
+        z3_json_str = verify_layout(output_dxf)
 
         try:
             z3_report = json.loads(z3_json_str)
@@ -125,7 +125,12 @@ def run_agent_loop(image_path: str, max_iterations: int = 5):
         # 4. EVALUATE: Check if it passed
         if z3_report.get("status") == "APPROVED":
             print("\nSUCCESS! The design is approved and optimized by Z3.")
-            print(f"Final Area: {z3_report['proposed_footprint']['calculated_area_sqft']} sq ft.")
+            # Calculate the total area by summing the area of each individual room
+            total_area = sum(
+                (room['xmax'] - room['xmin']) * (room['ymax'] - room['ymin'])
+                for room in z3_report.get('rooms', {}).values()
+            )
+            print(f"Final Area: {total_area:.1f} sq ft.")
             print(f"Final DXF File ready at: {output_dxf}")
             break
         else:

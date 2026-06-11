@@ -13,13 +13,19 @@ STRICT REQUIREMENTS:
    - You MUST draw the outermost property lines as an LWPOLYLINE on the 'LOT_BOUNDARY' layer accurately.
    - You MUST draw the protected tree(s) as a CIRCLE on the 'TREES' layer. 
    - (Our verification engine will dynamically extract these layers to grade your work).
-3. COMPOSITE FOOTPRINT (THE ROOMS): The house footprint is a rectilinear polygon formed by joining multiple adjacent rectangular rooms. 
-   - You must draw each room as a separate closed LWPOLYLINE on the 'ROOMS' layer.
+3. COMPOSITE FOOTPRINT (THE ROOMS): The house footprint is a rectilinear polygon formed by joining multiple adjacent rectangular rooms.
    - Exact Tiling: The rooms must perfectly tile against each other with NO gaps and NO overlaps.
-   - Program Requirements: You must include at least: "Living Room", "Kitchen", "Bedroom", "Bathroom", and "Corridor".
-4. INTERIOR RULES:
-   - The "Corridor" must be a distinct rectangular zone (approx 3ft or 1m wide) that connects the spaces.
-   - The "Bathroom" must be placed ENTIRELY INSIDE the boundaries of the "Bedroom" (as an attached en-suite).
+   - Human Scale Proportions: Rooms cannot be impossibly narrow. Every room must have a minimum width and depth of at least 8 feet, except for the Corridor.
+   - Aspect Ratio: The length-to-width ratio of any room (excluding corridors) must not exceed 2.5:1.
+4. INTERIOR RULES & SPECIFIC ROOM LOGIC:
+   - "Living Room": Must be the largest room, minimum area 250 sq ft.
+   - "Kitchen": Minimum area 100 sq ft.
+   - "Bedroom": Minimum area 120 sq ft.
+   - "Bathroom": Must be placed ENTIRELY INSIDE the boundaries of the "Bedroom" (as an attached en-suite). Minimum area 40 sq ft.
+   - "Corridor": Must be a distinct rectangular zone exactly 3 ft wide that connects spaces. You must not draw impossibly narrow hallways and label them as living spaces.
+   - Minimum Dimensions: Every room must have a minimum width and depth of at least 8 feet.
+   - "Garage": Must be attached to the main structure and minimum 200 sq ft.
+   - Area Maximization: You MUST scale these rooms outwards until the total square footage reaches 95% of the maximum ALLOWED Lot Coverage for the specified zone.
 5. FIRE SAFETY & ENTRY: 
    - Draw a 10ft wide LINE representing the Main Door on the 'SBC_DOOR' layer. 
    - CRUCIAL: The Main Door MUST lie exactly on one of the outer walls of the "Living Room". The entrance must lead directly into the Living Room.

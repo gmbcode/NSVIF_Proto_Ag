@@ -12,7 +12,7 @@ from openai import OpenAI
 
 # Local imports
 import prompts
-from Z3_Verifier import verify_layout
+from Z3_Verifier import verify_bellevue_layout
 
 # Load Environment Variables
 config = dotenv_values(".env")
@@ -114,7 +114,15 @@ def run_agent_loop(image_path: str, max_iterations: int = 5):
             continue
 
         print("[Z3 Solver] Evaluating constraints...")
-        z3_json_str = verify_layout(output_dxf)
+
+        # Define the specific Bellevue configuration for this run
+        bellevue_config = {
+            "zone": "R5",  # Or whatever zone you are testing
+            "corner_lot": False,  # True if testing corner lot rules
+            "garage_type": "attached"  # "attached" or "detached"
+        }
+
+        z3_json_str = verify_bellevue_layout(output_dxf, bellevue_config)
 
         try:
             z3_report = json.loads(z3_json_str)
@@ -125,12 +133,12 @@ def run_agent_loop(image_path: str, max_iterations: int = 5):
         # 4. EVALUATE: Check if it passed
         if z3_report.get("status") == "APPROVED":
             print("\nSUCCESS! The design is approved and optimized by Z3.")
-            # Calculate the total area by summing the area of each individual room
-            total_area = sum(
-                (room['xmax'] - room['xmin']) * (room['ymax'] - room['ymin'])
-                for room in z3_report.get('rooms', {}).values()
-            )
-            print(f"Final Area: {total_area:.1f} sq ft.")
+
+            # Pull the pre-calculated metrics from the Z3 JSON
+            total_area = z3_report.get("metrics", {}).get("actual_coverage", 0)
+            max_area = z3_report.get("metrics", {}).get("max_allowed_coverage", 0)
+
+            print(f"Final Area: {total_area:.1f} sq ft (Max allowed: {max_area:.1f} sq ft).")
             print(f"Final DXF File ready at: {output_dxf}")
             break
         else:
